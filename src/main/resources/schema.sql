@@ -1,0 +1,41 @@
+CREATE TABLE account
+(
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    balance DECIMAL(19,4) NOT NULL,
+    initial_balance DECIMAL(19,4),
+    currency VARCHAR(3),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE idempotent_item
+(
+    id VARCHAR(36) PRIMARY KEY,
+    response_json LONGTEXT,
+    response_status INT,
+    status VARCHAR(50) NOT NULL,
+    expires_at TIMESTAMP NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE transfer
+(
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    from_account BIGINT NOT NULL,
+    to_account BIGINT NOT NULL,
+    amount DECIMAL(19,4) NOT NULL,
+    rate DECIMAL(19,4) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (from_account) REFERENCES account(id),
+    FOREIGN KEY (to_account) REFERENCES account(id)
+);
+
+CREATE TABLE outbox_message
+(
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    payload LONGTEXT NOT NULL,
+    status VARCHAR(50) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
