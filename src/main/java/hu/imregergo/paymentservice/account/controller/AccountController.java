@@ -5,6 +5,7 @@ import hu.imregergo.paymentservice.account.dto.AccountResponse;
 import hu.imregergo.paymentservice.account.dto.CreateAccountDto;
 import hu.imregergo.paymentservice.account.mapper.AccountMapper;
 import hu.imregergo.paymentservice.account.service.AccountService;
+import hu.imregergo.paymentservice.idempotency.annotation.IdempotentEndpoint;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -23,6 +24,7 @@ public class AccountController {
     private final AccountService accountService;
 
     @PostMapping
+    @IdempotentEndpoint
     public AccountResponse createAccount(@Valid @RequestBody CreateAccountDto dto) {
         return AccountMapper.toResponse(accountService.createAccount(dto));
     }

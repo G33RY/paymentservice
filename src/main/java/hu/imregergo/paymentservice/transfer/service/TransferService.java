@@ -36,10 +36,20 @@ public class TransferService {
     public Transfer createTransfer(CreateTransferDto createTransferDto) throws AccountNotFoundException, NotEnoughBalanceException, ExchangeRateApiException, JsonProcessingException {
         Transfer transfer = new Transfer();
 
-        Account fromAccount = accountService.getAccount(createTransferDto.getFromAccountId(), true);
-        transfer.setFromAccount(AggregateReference.to(fromAccount.getId()));
+        Account fromAccount;
+        Account toAccount;
 
-        Account toAccount = accountService.getAccount(createTransferDto.getToAccountId(), true);
+        // To avoid deadlocks, we always lock the accounts in the same order based on their IDs
+        if (createTransferDto.getToAccountId() > createTransferDto.getFromAccountId()) {
+            fromAccount = accountService.getAccount(createTransferDto.getFromAccountId(), true);
+            toAccount = accountService.getAccount(createTransferDto.getToAccountId(), true);
+        } else {
+            toAccount = accountService.getAccount(createTransferDto.getToAccountId(), true);
+            fromAccount = accountService.getAccount(createTransferDto.getFromAccountId(), true);
+        }
+
+
+        transfer.setFromAccount(AggregateReference.to(fromAccount.getId()));
         transfer.setToAccount(AggregateReference.to(toAccount.getId()));
 
         transfer.setAmount(createTransferDto.getAmount());

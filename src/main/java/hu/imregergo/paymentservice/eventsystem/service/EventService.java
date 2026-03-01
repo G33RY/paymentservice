@@ -33,7 +33,7 @@ public class EventService {
     }
 
 
-    private void publishMessage(OutboxMessage msg) {
+    private void publishMessages(List<OutboxMessage> msg) {
         // Here I would use some message queue but for now I just LOG the messages
         LOG.info("Publishing message: {}", msg);
     }
@@ -46,12 +46,18 @@ public class EventService {
         if(messages.isEmpty()) {
             return;
         }
-        List<Long> ids = new ArrayList<>();
-        for (OutboxMessage msg : messages) {
-            publishMessage(msg);
-            ids.add(msg.getId());
+
+        List<Long> ids = messages.stream().map(OutboxMessage::getId).toList();
+        try {
+            publishMessages(messages);
+            outboxRepository.updateStateByIds(ids, OutboxMessageStatus.PUBLISHED);
+        } catch (Exception e) {
+            LOG.error("Error while publishing messages", e);
+            outboxRepository.updateStateByIds(ids, OutboxMessageStatus.FAILED);
+            return;
         }
-        outboxRepository.updateStateByIds(ids, OutboxMessageStatus.PUBLISHED);
+
+
     }
 
 }
