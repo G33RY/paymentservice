@@ -99,7 +99,7 @@ public class EventServiceTest {
     }
 
     @Test
-    void testNewEvent_jsonProcessingException_propagatesException() throws JsonProcessingException {
+    void testNewEvent_jsonProcessingException_wrappedInRuntimeException() throws JsonProcessingException {
         NewTransferEvent event = new NewTransferEvent();
         event.setFromAccountId(1L);
         event.setToAccountId(2L);
@@ -110,12 +110,13 @@ public class EventServiceTest {
                 });
 
         // Execute & Verify
-        JsonProcessingException exception = assertThrows(
-                JsonProcessingException.class,
+        RuntimeException exception = assertThrows(
+                RuntimeException.class,
                 () -> eventService.newEvent(event)
         );
 
-        assertThat(exception.getMessage(), containsString("Serialization failed"));
+        assertThat(exception.getMessage(), containsString("Failed to serialize outbox event"));
+        assertThat(exception.getCause().getMessage(), containsString("Serialization failed"));
 
         // Verify repository was never called
         verify(outboxRepository, never()).save(any(OutboxMessage.class));

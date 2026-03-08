@@ -1,6 +1,5 @@
 package hu.imregergo.paymentservice.transfer;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
 import hu.imregergo.paymentservice.account.entity.Account;
 import hu.imregergo.paymentservice.account.entity.Currency;
 import hu.imregergo.paymentservice.account.exception.AccountNotFoundException;
@@ -9,6 +8,7 @@ import hu.imregergo.paymentservice.eventsystem.service.EventService;
 import hu.imregergo.paymentservice.transfer.dto.CreateTransferDto;
 import hu.imregergo.paymentservice.transfer.dto.NewTransferEvent;
 import hu.imregergo.paymentservice.transfer.entity.Transfer;
+import hu.imregergo.paymentservice.transfer.exception.EventSerializationException;
 import hu.imregergo.paymentservice.transfer.exception.ExchangeRateApiException;
 import hu.imregergo.paymentservice.transfer.exception.NotEnoughBalanceException;
 import hu.imregergo.paymentservice.transfer.repository.TransferRepository;
@@ -20,6 +20,9 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.test.util.ReflectionTestUtils;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionStatus;
 
 import java.math.BigDecimal;
 import java.time.Instant;
@@ -46,11 +49,24 @@ public class TransferServiceTest {
     @Mock
     private EventService eventService;
 
+    @Mock
+    private PlatformTransactionManager transactionManager;
+
+    @Mock
+    private TransactionStatus transactionStatus;
+
     private TransferService transferService;
 
     @BeforeEach
     public void setUp() {
-        transferService = new TransferService(transferRepository, accountService, exchangeRateService, eventService);
+        // PlatformTransactionManager mock that executes the lambda immediately
+        lenient().when(transactionManager.getTransaction(any())).thenReturn(transactionStatus);
+        lenient().doNothing().when(transactionManager).commit(any());
+        lenient().doNothing().when(transactionManager).rollback(any());
+
+        transferService = new TransferService(transferRepository, accountService, exchangeRateService,
+                eventService, transactionManager);
+        ReflectionTestUtils.setField(transferService, "rateLimitMaxPerMinute", 10);
     }
 
 
@@ -58,7 +74,6 @@ public class TransferServiceTest {
 
     @Test
     void testCreateTransfer_success_sameCurrency() throws Exception {
-        // Setup
         CreateTransferDto dto = new CreateTransferDto();
         dto.setFromAccountId(1L);
         dto.setToAccountId(2L);
@@ -67,9 +82,14 @@ public class TransferServiceTest {
         Account fromAccount = createAccount(1L, Currency.USD, new BigDecimal("500.00"));
         Account toAccount = createAccount(2L, Currency.USD, new BigDecimal("200.00"));
 
+        when(transferRepository.countRecentTransfers(eq(1L), any(Instant.class))).thenReturn(0);
+        // Non-locking fetch (pre-transaction, for early validation)
+        when(accountService.getAccount(1L)).thenReturn(fromAccount);
+        when(accountService.getAccount(2L)).thenReturn(toAccount);
+        when(exchangeRateService.getExchangeRate(Currency.USD, Currency.USD)).thenReturn(BigDecimal.ONE);
+        // Locking fetch (inside transaction)
         when(accountService.getAccount(1L, true)).thenReturn(fromAccount);
         when(accountService.getAccount(2L, true)).thenReturn(toAccount);
-        when(exchangeRateService.getExchangeRate(Currency.USD, Currency.USD)).thenReturn(BigDecimal.ONE);
         when(accountService.save(any(Account.class))).thenAnswer(invocation -> invocation.getArgument(0));
         when(transferRepository.save(any(Transfer.class))).thenAnswer(invocation -> {
             Transfer t = invocation.getArgument(0);
@@ -78,29 +98,23 @@ public class TransferServiceTest {
         });
         doNothing().when(eventService).newEvent(any(NewTransferEvent.class));
 
-        // Execute
         Transfer result = transferService.createTransfer(dto);
 
-        // Verify
         assertThat(result.getId(), is(100L));
         assertThat(result.getAmount(), is(new BigDecimal("100.00")));
         assertThat(result.getRate(), is(BigDecimal.ONE));
 
-        // Verify account balances updated
         verify(accountService).save(argThat(account ->
                 account.getId().equals(1L) && account.getBalance().compareTo(new BigDecimal("400.00")) == 0
         ));
         verify(accountService).save(argThat(account ->
                 account.getId().equals(2L) && account.getBalance().compareTo(new BigDecimal("300.00")) == 0
         ));
-
-        // Verify event published
         verify(eventService, times(1)).newEvent(any(NewTransferEvent.class));
     }
 
     @Test
     void testCreateTransfer_success_differentCurrencies() throws Exception {
-        // Setup - USD to EUR with exchange rate 0.85
         CreateTransferDto dto = new CreateTransferDto();
         dto.setFromAccountId(1L);
         dto.setToAccountId(2L);
@@ -109,9 +123,12 @@ public class TransferServiceTest {
         Account fromAccount = createAccount(1L, Currency.USD, new BigDecimal("500.00"));
         Account toAccount = createAccount(2L, Currency.EUR, new BigDecimal("200.00"));
 
+        when(transferRepository.countRecentTransfers(eq(1L), any(Instant.class))).thenReturn(0);
+        when(accountService.getAccount(1L)).thenReturn(fromAccount);
+        when(accountService.getAccount(2L)).thenReturn(toAccount);
+        when(exchangeRateService.getExchangeRate(Currency.USD, Currency.EUR)).thenReturn(new BigDecimal("0.85"));
         when(accountService.getAccount(1L, true)).thenReturn(fromAccount);
         when(accountService.getAccount(2L, true)).thenReturn(toAccount);
-        when(exchangeRateService.getExchangeRate(Currency.USD, Currency.EUR)).thenReturn(new BigDecimal("0.85"));
         when(accountService.save(any(Account.class))).thenAnswer(invocation -> invocation.getArgument(0));
         when(transferRepository.save(any(Transfer.class))).thenAnswer(invocation -> {
             Transfer t = invocation.getArgument(0);
@@ -120,18 +137,13 @@ public class TransferServiceTest {
         });
         doNothing().when(eventService).newEvent(any(NewTransferEvent.class));
 
-        // Execute
         Transfer result = transferService.createTransfer(dto);
 
-        // Verify
         assertThat(result.getRate(), is(new BigDecimal("0.85")));
 
-        // Verify from account debited 100 USD
         verify(accountService).save(argThat(account ->
                 account.getId().equals(1L) && account.getBalance().compareTo(new BigDecimal("400.00")) == 0
         ));
-
-        // Verify to account credited 85 EUR (100 * 0.85)
         verify(accountService).save(argThat(account ->
                 account.getId().equals(2L) && account.getBalance().compareTo(new BigDecimal("285.00")) == 0
         ));
@@ -139,7 +151,6 @@ public class TransferServiceTest {
 
     @Test
     void testCreateTransfer_success_exactBalance() throws Exception {
-        // Setup - transfer entire balance
         CreateTransferDto dto = new CreateTransferDto();
         dto.setFromAccountId(1L);
         dto.setToAccountId(2L);
@@ -148,9 +159,12 @@ public class TransferServiceTest {
         Account fromAccount = createAccount(1L, Currency.USD, new BigDecimal("500.00"));
         Account toAccount = createAccount(2L, Currency.USD, new BigDecimal("0.00"));
 
+        when(transferRepository.countRecentTransfers(eq(1L), any(Instant.class))).thenReturn(0);
+        when(accountService.getAccount(1L)).thenReturn(fromAccount);
+        when(accountService.getAccount(2L)).thenReturn(toAccount);
+        when(exchangeRateService.getExchangeRate(Currency.USD, Currency.USD)).thenReturn(BigDecimal.ONE);
         when(accountService.getAccount(1L, true)).thenReturn(fromAccount);
         when(accountService.getAccount(2L, true)).thenReturn(toAccount);
-        when(exchangeRateService.getExchangeRate(Currency.USD, Currency.USD)).thenReturn(BigDecimal.ONE);
         when(accountService.save(any(Account.class))).thenAnswer(invocation -> invocation.getArgument(0));
         when(transferRepository.save(any(Transfer.class))).thenAnswer(invocation -> {
             Transfer t = invocation.getArgument(0);
@@ -159,15 +173,11 @@ public class TransferServiceTest {
         });
         doNothing().when(eventService).newEvent(any(NewTransferEvent.class));
 
-        // Execute
         transferService.createTransfer(dto);
 
-        // Verify from account has zero balance
         verify(accountService).save(argThat(account ->
                 account.getId().equals(1L) && account.getBalance().compareTo(BigDecimal.ZERO) == 0
         ));
-
-        // Verify to account credited full amount
         verify(accountService).save(argThat(account ->
                 account.getId().equals(2L) && account.getBalance().compareTo(new BigDecimal("500.00")) == 0
         ));
@@ -183,9 +193,12 @@ public class TransferServiceTest {
         Account fromAccount = createAccount(1L, Currency.USD, new BigDecimal("500.00"));
         Account toAccount = createAccount(2L, Currency.USD, new BigDecimal("200.00"));
 
+        when(transferRepository.countRecentTransfers(eq(1L), any(Instant.class))).thenReturn(0);
+        when(accountService.getAccount(1L)).thenReturn(fromAccount);
+        when(accountService.getAccount(2L)).thenReturn(toAccount);
+        when(exchangeRateService.getExchangeRate(Currency.USD, Currency.USD)).thenReturn(BigDecimal.ONE);
         when(accountService.getAccount(1L, true)).thenReturn(fromAccount);
         when(accountService.getAccount(2L, true)).thenReturn(toAccount);
-        when(exchangeRateService.getExchangeRate(Currency.USD, Currency.USD)).thenReturn(BigDecimal.ONE);
         when(accountService.save(any(Account.class))).thenAnswer(invocation -> invocation.getArgument(0));
         when(transferRepository.save(any(Transfer.class))).thenAnswer(invocation -> {
             Transfer t = invocation.getArgument(0);
@@ -194,12 +207,13 @@ public class TransferServiceTest {
         });
         doNothing().when(eventService).newEvent(any(NewTransferEvent.class));
 
-        // Execute
         transferService.createTransfer(dto);
 
-        // Verify accounts are fetched with lock (true parameter)
+        // Verify accounts are fetched with lock inside transaction
         verify(accountService, times(1)).getAccount(1L, true);
         verify(accountService, times(1)).getAccount(2L, true);
+        // Also verify exchange rate is called with correct currencies
+        verify(exchangeRateService, times(1)).getExchangeRate(Currency.USD, Currency.USD);
     }
 
     @Test
@@ -212,9 +226,12 @@ public class TransferServiceTest {
         Account fromAccount = createAccount(1L, Currency.USD, new BigDecimal("500.00"));
         Account toAccount = createAccount(2L, Currency.USD, new BigDecimal("200.00"));
 
+        when(transferRepository.countRecentTransfers(eq(1L), any(Instant.class))).thenReturn(0);
+        when(accountService.getAccount(1L)).thenReturn(fromAccount);
+        when(accountService.getAccount(2L)).thenReturn(toAccount);
+        when(exchangeRateService.getExchangeRate(Currency.USD, Currency.USD)).thenReturn(BigDecimal.ONE);
         when(accountService.getAccount(1L, true)).thenReturn(fromAccount);
         when(accountService.getAccount(2L, true)).thenReturn(toAccount);
-        when(exchangeRateService.getExchangeRate(Currency.USD, Currency.USD)).thenReturn(BigDecimal.ONE);
         when(accountService.save(any(Account.class))).thenAnswer(invocation -> invocation.getArgument(0));
         when(transferRepository.save(any(Transfer.class))).thenAnswer(invocation -> {
             Transfer t = invocation.getArgument(0);
@@ -223,10 +240,8 @@ public class TransferServiceTest {
         });
         doNothing().when(eventService).newEvent(any(NewTransferEvent.class));
 
-        // Execute
         transferService.createTransfer(dto);
 
-        // Verify event published with correct data
         ArgumentCaptor<NewTransferEvent> eventCaptor = ArgumentCaptor.forClass(NewTransferEvent.class);
         verify(eventService).newEvent(eventCaptor.capture());
 
@@ -237,10 +252,33 @@ public class TransferServiceTest {
     }
 
 
+    // ========== SELF-TRANSFER TEST ==========
+
+    @Test
+    void testCreateTransfer_sameAccount_throwsException() {
+        CreateTransferDto dto = new CreateTransferDto();
+        dto.setFromAccountId(1L);
+        dto.setToAccountId(1L);
+        dto.setAmount(new BigDecimal("100.00"));
+
+        IllegalArgumentException exception = assertThrows(
+                IllegalArgumentException.class,
+                () -> transferService.createTransfer(dto)
+        );
+
+        assertThat(exception.getMessage(), containsString("Cannot transfer to the same account"));
+
+        // Verify nothing else was called
+        verify(transferRepository, never()).countRecentTransfers(any(), any());
+        verify(accountService, never()).getAccount(any());
+        verify(exchangeRateService, never()).getExchangeRate(any(), any());
+    }
+
+
     // ========== NOT ENOUGH BALANCE TESTS ==========
 
     @Test
-    void testCreateTransfer_notEnoughBalance_throwsException() throws Exception {
+    void testCreateTransfer_notEnoughBalance_throwsException() {
         CreateTransferDto dto = new CreateTransferDto();
         dto.setFromAccountId(1L);
         dto.setToAccountId(2L);
@@ -249,11 +287,11 @@ public class TransferServiceTest {
         Account fromAccount = createAccount(1L, Currency.USD, new BigDecimal("500.00"));
         Account toAccount = createAccount(2L, Currency.USD, new BigDecimal("200.00"));
 
-        when(accountService.getAccount(1L, true)).thenReturn(fromAccount);
-        when(accountService.getAccount(2L, true)).thenReturn(toAccount);
-        when(exchangeRateService.getExchangeRate(Currency.USD, Currency.USD)).thenReturn(BigDecimal.ONE);
+        when(transferRepository.countRecentTransfers(eq(1L), any(Instant.class))).thenReturn(0);
+        // Non-locking fetch for early balance validation
+        when(accountService.getAccount(1L)).thenReturn(fromAccount);
+        when(accountService.getAccount(2L)).thenReturn(toAccount);
 
-        // Execute & Verify
         NotEnoughBalanceException exception = assertThrows(
                 NotEnoughBalanceException.class,
                 () -> transferService.createTransfer(dto)
@@ -261,18 +299,17 @@ public class TransferServiceTest {
 
         assertThat(exception.getMessage(), containsString("Not enough balance"));
 
-        // Verify no accounts were saved
+        // Exchange rate must NOT be called (fail fast before network call)
+        verify(exchangeRateService, never()).getExchangeRate(any(), any());
+        // No accounts locked (no transaction entered)
+        verify(accountService, never()).getAccount(eq(1L), anyBoolean());
         verify(accountService, never()).save(any(Account.class));
-
-        // Verify no transfer was saved
         verify(transferRepository, never()).save(any(Transfer.class));
-
-        // Verify no event was published
         verify(eventService, never()).newEvent(any(NewTransferEvent.class));
     }
 
     @Test
-    void testCreateTransfer_notEnoughBalance_byOneCent() throws Exception {
+    void testCreateTransfer_notEnoughBalance_byOneCent() {
         CreateTransferDto dto = new CreateTransferDto();
         dto.setFromAccountId(1L);
         dto.setToAccountId(2L);
@@ -281,17 +318,13 @@ public class TransferServiceTest {
         Account fromAccount = createAccount(1L, Currency.USD, new BigDecimal("500.00"));
         Account toAccount = createAccount(2L, Currency.USD, new BigDecimal("200.00"));
 
-        when(accountService.getAccount(1L, true)).thenReturn(fromAccount);
-        when(accountService.getAccount(2L, true)).thenReturn(toAccount);
-        when(exchangeRateService.getExchangeRate(Currency.USD, Currency.USD)).thenReturn(BigDecimal.ONE);
+        when(transferRepository.countRecentTransfers(eq(1L), any(Instant.class))).thenReturn(0);
+        when(accountService.getAccount(1L)).thenReturn(fromAccount);
+        when(accountService.getAccount(2L)).thenReturn(toAccount);
 
-        // Execute & Verify
-        assertThrows(
-                NotEnoughBalanceException.class,
-                () -> transferService.createTransfer(dto)
-        );
+        assertThrows(NotEnoughBalanceException.class, () -> transferService.createTransfer(dto));
 
-        // Verify no state changes occurred
+        verify(exchangeRateService, never()).getExchangeRate(any(), any());
         verify(accountService, never()).save(any(Account.class));
         verify(transferRepository, never()).save(any(Transfer.class));
         verify(eventService, never()).newEvent(any(NewTransferEvent.class));
@@ -307,59 +340,29 @@ public class TransferServiceTest {
         Account fromAccount = createAccount(1L, Currency.USD, BigDecimal.ZERO);
         Account toAccount = createAccount(2L, Currency.USD, new BigDecimal("200.00"));
 
-        when(accountService.getAccount(1L, true)).thenReturn(fromAccount);
-        when(accountService.getAccount(2L, true)).thenReturn(toAccount);
-        when(exchangeRateService.getExchangeRate(Currency.USD, Currency.USD)).thenReturn(BigDecimal.ONE);
+        when(transferRepository.countRecentTransfers(eq(1L), any(Instant.class))).thenReturn(0);
+        when(accountService.getAccount(1L)).thenReturn(fromAccount);
+        when(accountService.getAccount(2L)).thenReturn(toAccount);
 
-        // Execute & Verify
-        assertThrows(
-                NotEnoughBalanceException.class,
-                () -> transferService.createTransfer(dto)
-        );
+        assertThrows(NotEnoughBalanceException.class, () -> transferService.createTransfer(dto));
+
+        verify(exchangeRateService, never()).getExchangeRate(any(), any());
     }
 
 
     // ========== ACCOUNT NOT FOUND TESTS ==========
 
     @Test
-    void testCreateTransfer_fromAccountNotFound_throwsException() throws Exception {
+    void testCreateTransfer_fromAccountNotFound_throwsException() {
         CreateTransferDto dto = new CreateTransferDto();
         dto.setFromAccountId(999L);
         dto.setToAccountId(2L);
         dto.setAmount(new BigDecimal("100.00"));
 
-        when(accountService.getAccount(2L, true)).thenThrow(new AccountNotFoundException(2L));
+        when(transferRepository.countRecentTransfers(eq(999L), any(Instant.class))).thenReturn(0);
+        // Non-locking fetch: from account (999L) fetched first, throws
+        when(accountService.getAccount(999L)).thenThrow(new AccountNotFoundException(999L));
 
-        // Execute & Verify
-        AccountNotFoundException exception = assertThrows(
-                AccountNotFoundException.class,
-                () -> transferService.createTransfer(dto)
-        );
-
-        // Should fail on the lowest ID first (from account)
-        assertThat(exception.getMessage(), containsString("2"));
-
-        // Verify no further operations occurred
-        verify(accountService, never()).getAccount(eq(999L), anyBoolean());
-        verify(exchangeRateService, never()).getExchangeRate(any(), any());
-        verify(accountService, never()).save(any(Account.class));
-        verify(transferRepository, never()).save(any(Transfer.class));
-        verify(eventService, never()).newEvent(any(NewTransferEvent.class));
-    }
-
-    @Test
-    void testCreateTransfer_toAccountNotFound_throwsException() throws Exception {
-        CreateTransferDto dto = new CreateTransferDto();
-        dto.setFromAccountId(1L);
-        dto.setToAccountId(999L);
-        dto.setAmount(new BigDecimal("100.00"));
-
-        Account fromAccount = createAccount(1L, Currency.USD, new BigDecimal("500.00"));
-
-        when(accountService.getAccount(1L, true)).thenReturn(fromAccount);
-        when(accountService.getAccount(999L, true)).thenThrow(new AccountNotFoundException(999L));
-
-        // Execute & Verify
         AccountNotFoundException exception = assertThrows(
                 AccountNotFoundException.class,
                 () -> transferService.createTransfer(dto)
@@ -367,7 +370,35 @@ public class TransferServiceTest {
 
         assertThat(exception.getMessage(), containsString("999"));
 
-        // Verify no state changes occurred
+        // to account was never fetched
+        verify(accountService, never()).getAccount(eq(2L));
+        verify(accountService, never()).getAccount(eq(2L), anyBoolean());
+        verify(exchangeRateService, never()).getExchangeRate(any(), any());
+        verify(accountService, never()).save(any(Account.class));
+        verify(transferRepository, never()).save(any(Transfer.class));
+        verify(eventService, never()).newEvent(any(NewTransferEvent.class));
+    }
+
+    @Test
+    void testCreateTransfer_toAccountNotFound_throwsException() {
+        CreateTransferDto dto = new CreateTransferDto();
+        dto.setFromAccountId(1L);
+        dto.setToAccountId(999L);
+        dto.setAmount(new BigDecimal("100.00"));
+
+        Account fromAccount = createAccount(1L, Currency.USD, new BigDecimal("500.00"));
+
+        when(transferRepository.countRecentTransfers(eq(1L), any(Instant.class))).thenReturn(0);
+        when(accountService.getAccount(1L)).thenReturn(fromAccount);
+        when(accountService.getAccount(999L)).thenThrow(new AccountNotFoundException(999L));
+
+        AccountNotFoundException exception = assertThrows(
+                AccountNotFoundException.class,
+                () -> transferService.createTransfer(dto)
+        );
+
+        assertThat(exception.getMessage(), containsString("999"));
+
         verify(accountService, never()).save(any(Account.class));
         verify(transferRepository, never()).save(any(Transfer.class));
         verify(eventService, never()).newEvent(any(NewTransferEvent.class));
@@ -380,9 +411,9 @@ public class TransferServiceTest {
         dto.setToAccountId(999L);
         dto.setAmount(new BigDecimal("100.00"));
 
-        when(accountService.getAccount(888L, true)).thenThrow(new AccountNotFoundException(888L));
+        when(transferRepository.countRecentTransfers(eq(888L), any(Instant.class))).thenReturn(0);
+        when(accountService.getAccount(888L)).thenThrow(new AccountNotFoundException(888L));
 
-        // Execute & Verify - should fail on from account first
         AccountNotFoundException exception = assertThrows(
                 AccountNotFoundException.class,
                 () -> transferService.createTransfer(dto)
@@ -390,7 +421,8 @@ public class TransferServiceTest {
 
         assertThat(exception.getMessage(), containsString("888"));
 
-        // Verify to account was never checked
+        // to account was never fetched
+        verify(accountService, never()).getAccount(eq(999L));
         verify(accountService, never()).getAccount(eq(999L), anyBoolean());
     }
 
@@ -398,7 +430,7 @@ public class TransferServiceTest {
     // ========== EXCHANGE RATE API FAILURE TESTS ==========
 
     @Test
-    void testCreateTransfer_exchangeRateApiFails_throwsException() throws Exception {
+    void testCreateTransfer_exchangeRateApiFails_throwsException() {
         CreateTransferDto dto = new CreateTransferDto();
         dto.setFromAccountId(1L);
         dto.setToAccountId(2L);
@@ -407,12 +439,12 @@ public class TransferServiceTest {
         Account fromAccount = createAccount(1L, Currency.USD, new BigDecimal("500.00"));
         Account toAccount = createAccount(2L, Currency.EUR, new BigDecimal("200.00"));
 
-        when(accountService.getAccount(1L, true)).thenReturn(fromAccount);
-        when(accountService.getAccount(2L, true)).thenReturn(toAccount);
+        when(transferRepository.countRecentTransfers(eq(1L), any(Instant.class))).thenReturn(0);
+        when(accountService.getAccount(1L)).thenReturn(fromAccount);
+        when(accountService.getAccount(2L)).thenReturn(toAccount);
         when(exchangeRateService.getExchangeRate(Currency.USD, Currency.EUR))
                 .thenThrow(new ExchangeRateApiException("API unavailable"));
 
-        // Execute & Verify
         ExchangeRateApiException exception = assertThrows(
                 ExchangeRateApiException.class,
                 () -> transferService.createTransfer(dto)
@@ -420,14 +452,15 @@ public class TransferServiceTest {
 
         assertThat(exception.getMessage(), containsString("API unavailable"));
 
-        // Verify no state changes occurred
+        // Exchange rate failed before transaction — no locks acquired
+        verify(accountService, never()).getAccount(eq(1L), anyBoolean());
         verify(accountService, never()).save(any(Account.class));
         verify(transferRepository, never()).save(any(Transfer.class));
         verify(eventService, never()).newEvent(any(NewTransferEvent.class));
     }
 
     @Test
-    void testCreateTransfer_exchangeRateApiTimeout_throwsException() throws Exception {
+    void testCreateTransfer_exchangeRateApiTimeout_throwsException() {
         CreateTransferDto dto = new CreateTransferDto();
         dto.setFromAccountId(1L);
         dto.setToAccountId(2L);
@@ -436,12 +469,12 @@ public class TransferServiceTest {
         Account fromAccount = createAccount(1L, Currency.USD, new BigDecimal("500.00"));
         Account toAccount = createAccount(2L, Currency.GBP, new BigDecimal("200.00"));
 
-        when(accountService.getAccount(1L, true)).thenReturn(fromAccount);
-        when(accountService.getAccount(2L, true)).thenReturn(toAccount);
+        when(transferRepository.countRecentTransfers(eq(1L), any(Instant.class))).thenReturn(0);
+        when(accountService.getAccount(1L)).thenReturn(fromAccount);
+        when(accountService.getAccount(2L)).thenReturn(toAccount);
         when(exchangeRateService.getExchangeRate(Currency.USD, Currency.GBP))
                 .thenThrow(new ExchangeRateApiException("Request timeout"));
 
-        // Execute & Verify
         ExchangeRateApiException exception = assertThrows(
                 ExchangeRateApiException.class,
                 () -> transferService.createTransfer(dto)
@@ -449,17 +482,16 @@ public class TransferServiceTest {
 
         assertThat(exception.getMessage(), containsString("Request timeout"));
 
-        // Verify transaction was rolled back (no saves)
         verify(accountService, never()).save(any(Account.class));
         verify(transferRepository, never()).save(any(Transfer.class));
         verify(eventService, never()).newEvent(any(NewTransferEvent.class));
     }
 
 
-    // ========== JSON PROCESSING EXCEPTION TESTS ==========
+    // ========== EVENT SERIALIZATION EXCEPTION TESTS ==========
 
     @Test
-    void testCreateTransfer_eventServiceThrowsJsonException_propagatesException() throws Exception {
+    void testCreateTransfer_eventServiceThrowsException_wrappedAsEventSerializationException() throws Exception {
         CreateTransferDto dto = new CreateTransferDto();
         dto.setFromAccountId(1L);
         dto.setToAccountId(2L);
@@ -468,44 +500,48 @@ public class TransferServiceTest {
         Account fromAccount = createAccount(1L, Currency.USD, new BigDecimal("500.00"));
         Account toAccount = createAccount(2L, Currency.USD, new BigDecimal("200.00"));
 
+        when(transferRepository.countRecentTransfers(eq(1L), any(Instant.class))).thenReturn(0);
+        when(accountService.getAccount(1L)).thenReturn(fromAccount);
+        when(accountService.getAccount(2L)).thenReturn(toAccount);
+        when(exchangeRateService.getExchangeRate(Currency.USD, Currency.USD)).thenReturn(BigDecimal.ONE);
         when(accountService.getAccount(1L, true)).thenReturn(fromAccount);
         when(accountService.getAccount(2L, true)).thenReturn(toAccount);
-        when(exchangeRateService.getExchangeRate(Currency.USD, Currency.USD)).thenReturn(BigDecimal.ONE);
         when(accountService.save(any(Account.class))).thenAnswer(invocation -> invocation.getArgument(0));
         when(transferRepository.save(any(Transfer.class))).thenAnswer(invocation -> {
             Transfer t = invocation.getArgument(0);
             t.setId(105L);
             return t;
         });
-        doThrow(new JsonProcessingException("Failed to serialize event") {
-        })
+        doThrow(new RuntimeException("Failed to serialize event"))
                 .when(eventService).newEvent(any(NewTransferEvent.class));
 
-        // Execute & Verify
-        JsonProcessingException exception = assertThrows(
-                JsonProcessingException.class,
+        EventSerializationException exception = assertThrows(
+                EventSerializationException.class,
                 () -> transferService.createTransfer(dto)
         );
 
-        assertThat(exception.getMessage(), containsString("Failed to serialize event"));
+        assertThat(exception.getMessage(), containsString("serialize"));
     }
 
 
-    // ========== EDGE CASES AND INTEGRATION TESTS ==========
+    // ========== EDGE CASES ==========
 
     @Test
     void testCreateTransfer_smallAmount_handlesCorrectly() throws Exception {
         CreateTransferDto dto = new CreateTransferDto();
         dto.setFromAccountId(1L);
         dto.setToAccountId(2L);
-        dto.setAmount(new BigDecimal("0.01")); // 1 cent
+        dto.setAmount(new BigDecimal("0.01"));
 
         Account fromAccount = createAccount(1L, Currency.USD, new BigDecimal("10.00"));
         Account toAccount = createAccount(2L, Currency.USD, new BigDecimal("5.00"));
 
+        when(transferRepository.countRecentTransfers(eq(1L), any(Instant.class))).thenReturn(0);
+        when(accountService.getAccount(1L)).thenReturn(fromAccount);
+        when(accountService.getAccount(2L)).thenReturn(toAccount);
+        when(exchangeRateService.getExchangeRate(Currency.USD, Currency.USD)).thenReturn(BigDecimal.ONE);
         when(accountService.getAccount(1L, true)).thenReturn(fromAccount);
         when(accountService.getAccount(2L, true)).thenReturn(toAccount);
-        when(exchangeRateService.getExchangeRate(Currency.USD, Currency.USD)).thenReturn(BigDecimal.ONE);
         when(accountService.save(any(Account.class))).thenAnswer(invocation -> invocation.getArgument(0));
         when(transferRepository.save(any(Transfer.class))).thenAnswer(invocation -> {
             Transfer t = invocation.getArgument(0);
@@ -514,10 +550,8 @@ public class TransferServiceTest {
         });
         doNothing().when(eventService).newEvent(any(NewTransferEvent.class));
 
-        // Execute
         Transfer result = transferService.createTransfer(dto);
 
-        // Verify
         assertThat(result.getAmount(), is(new BigDecimal("0.01")));
         verify(accountService).save(argThat(account ->
                 account.getId().equals(1L) && account.getBalance().compareTo(new BigDecimal("9.99")) == 0
@@ -534,9 +568,12 @@ public class TransferServiceTest {
         Account fromAccount = createAccount(1L, Currency.USD, new BigDecimal("10000000.00"));
         Account toAccount = createAccount(2L, Currency.USD, BigDecimal.ZERO);
 
+        when(transferRepository.countRecentTransfers(eq(1L), any(Instant.class))).thenReturn(0);
+        when(accountService.getAccount(1L)).thenReturn(fromAccount);
+        when(accountService.getAccount(2L)).thenReturn(toAccount);
+        when(exchangeRateService.getExchangeRate(Currency.USD, Currency.USD)).thenReturn(BigDecimal.ONE);
         when(accountService.getAccount(1L, true)).thenReturn(fromAccount);
         when(accountService.getAccount(2L, true)).thenReturn(toAccount);
-        when(exchangeRateService.getExchangeRate(Currency.USD, Currency.USD)).thenReturn(BigDecimal.ONE);
         when(accountService.save(any(Account.class))).thenAnswer(invocation -> invocation.getArgument(0));
         when(transferRepository.save(any(Transfer.class))).thenAnswer(invocation -> {
             Transfer t = invocation.getArgument(0);
@@ -545,10 +582,8 @@ public class TransferServiceTest {
         });
         doNothing().when(eventService).newEvent(any(NewTransferEvent.class));
 
-        // Execute
         Transfer result = transferService.createTransfer(dto);
 
-        // Verify
         assertThat(result.getAmount(), is(new BigDecimal("9999999.9999")));
         verify(transferRepository, times(1)).save(any(Transfer.class));
     }
@@ -563,12 +598,14 @@ public class TransferServiceTest {
         Account fromAccount = createAccount(1L, Currency.USD, new BigDecimal("500.00"));
         Account toAccount = createAccount(2L, Currency.EUR, new BigDecimal("200.00"));
 
-        // Complex exchange rate
         BigDecimal exchangeRate = new BigDecimal("0.8567");
 
+        when(transferRepository.countRecentTransfers(eq(1L), any(Instant.class))).thenReturn(0);
+        when(accountService.getAccount(1L)).thenReturn(fromAccount);
+        when(accountService.getAccount(2L)).thenReturn(toAccount);
+        when(exchangeRateService.getExchangeRate(Currency.USD, Currency.EUR)).thenReturn(exchangeRate);
         when(accountService.getAccount(1L, true)).thenReturn(fromAccount);
         when(accountService.getAccount(2L, true)).thenReturn(toAccount);
-        when(exchangeRateService.getExchangeRate(Currency.USD, Currency.EUR)).thenReturn(exchangeRate);
         when(accountService.save(any(Account.class))).thenAnswer(invocation -> invocation.getArgument(0));
         when(transferRepository.save(any(Transfer.class))).thenAnswer(invocation -> {
             Transfer t = invocation.getArgument(0);
@@ -577,44 +614,12 @@ public class TransferServiceTest {
         });
         doNothing().when(eventService).newEvent(any(NewTransferEvent.class));
 
-        // Execute
         Transfer result = transferService.createTransfer(dto);
 
-        // Verify exchange rate stored
         assertThat(result.getRate(), is(exchangeRate));
-
-        // Verify to account credited with converted amount (100 * 0.8567 = 85.67)
         verify(accountService).save(argThat(account ->
                 account.getId().equals(2L) && account.getBalance().compareTo(new BigDecimal("285.67")) == 0
         ));
-    }
-
-    @Test
-    void testCreateTransfer_sameAccount_stillProcesses() throws Exception {
-        // Edge case: transferring from account to itself
-        CreateTransferDto dto = new CreateTransferDto();
-        dto.setFromAccountId(1L);
-        dto.setToAccountId(1L);
-        dto.setAmount(new BigDecimal("100.00"));
-
-        Account account = createAccount(1L, Currency.USD, new BigDecimal("500.00"));
-
-        when(accountService.getAccount(1L, true)).thenReturn(account);
-        when(exchangeRateService.getExchangeRate(Currency.USD, Currency.USD)).thenReturn(BigDecimal.ONE);
-        when(accountService.save(any(Account.class))).thenAnswer(invocation -> invocation.getArgument(0));
-        when(transferRepository.save(any(Transfer.class))).thenAnswer(invocation -> {
-            Transfer t = invocation.getArgument(0);
-            t.setId(109L);
-            return t;
-        });
-        doNothing().when(eventService).newEvent(any(NewTransferEvent.class));
-
-        // Execute
-        Transfer result = transferService.createTransfer(dto);
-
-        // Verify transfer created (business logic may want to prevent this, but testing current behavior)
-        assertNotNull(result);
-        assertThat(result.getId(), is(109L));
     }
 
 

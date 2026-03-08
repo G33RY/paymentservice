@@ -25,10 +25,14 @@ public class EventService {
     private final ObjectMapper objectMapper;
 
     @Transactional
-    public <ET extends Event> void newEvent(ET event) throws JsonProcessingException {
+    public <ET extends Event> void newEvent(ET event) {
         OutboxMessage msg = new OutboxMessage();
         msg.setStatus(OutboxMessageStatus.PENDING);
-        msg.setPayload(objectMapper.writeValueAsString(event));
+        try {
+            msg.setPayload(objectMapper.writeValueAsString(event));
+        } catch (JsonProcessingException e) {
+            throw new RuntimeException("Failed to serialize outbox event", e);
+        }
         outboxRepository.save(msg);
     }
 

@@ -12,3 +12,27 @@ spring:
 
 server:
   port: 8080
+
+transfer:
+  rate-limit:
+    max-per-minute: 10
+
+resilience4j:
+  retry:
+    instances:
+      exchangeRate:
+        maxAttempts: 3
+        waitDuration: 500ms
+        enableExponentialBackoff: true
+        exponentialBackoffMultiplier: 2
+        retryExceptions:
+          - hu.imregergo.paymentservice.transfer.exception.ExchangeRateApiException
+  circuitbreaker:
+    instances:
+      exchangeRate:
+        slidingWindowType: COUNT_BASED
+        slidingWindowSize: 10
+        failureRateThreshold: 50
+        waitDurationInOpenState: 30s
+        permittedNumberOfCallsInHalfOpenState: 3
+        registerHealthIndicator: true
